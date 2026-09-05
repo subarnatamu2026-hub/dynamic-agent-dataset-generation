@@ -1,0 +1,22 @@
+# craftium engine + mods are cloned at setup time (see reinstall.sh), not tracked
+gym_envs/
+
+# generated datasets
+datasets/
+
+# python / uv
+.venv/
+__pycache__/
+*.pyc
+.uv-cache/
+.hf-cache/
+
+# HPRC / containers / logs
+logs/
+*.sif
+*.sqfs
+ch-storage/
+
+# misc
+.DS_Store
+resume.log

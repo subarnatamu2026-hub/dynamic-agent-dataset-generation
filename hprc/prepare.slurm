@@ -1,0 +1,38 @@
+#!/bin/bash
+# Batch job: compute the seen/unseen split and initialize the three datasets'
+# level seeds (light; no Minetest launched). Depends on setup finishing first.
+#SBATCH --job-name=craftium-prepare
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+#SBATCH --time=00:30:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+### #SBATCH --account=YOUR_ACCOUNT
+### #SBATCH --partition=YOUR_PARTITION
+
+set -e
+mkdir -p logs
+cd "$SCRATCH/dynamic-agent-dataset-generation"
+source hprc/container.sh
+FRAMES="${FRAMES:-600}"
+# Targets: train 100, eval 40 split 70/30 -> eval1 28 (seen), eval2 12 (unseen).
+TRAIN_N="${TRAIN_N:-100}"; EVAL1_N="${EVAL1_N:-28}"; EVAL2_N="${EVAL2_N:-12}"
+
+ctr_exec "
+  set -e
+  cd '$SCRATCH/dynamic-agent-dataset-generation' && source .venv/bin/activate
+  python tools/agent_splits.py
+  SEEN=\$(cat datasets/agent_split/seen.txt)
+  UNSEEN=\$(cat datasets/agent_split/unseen.txt)
+  init () {  # name nlevels seed entities
+    uv run python dataset_toolkits/generate_raw_data.py --dataset_dir datasets \
+      --dataset_name \"\$1\" --env_id OpenWorldCreative-v0 --ep_timesteps $FRAMES \
+      --seed \"\$3\" --init --overwrite_init --num_levels \"\$2\" \
+      --dynamic_agent_entities \"\$4\"
+  }
+  init train $TRAIN_N 1 \"\$SEEN\"
+  init eval1 $EVAL1_N 2 \"\$SEEN\"
+  init eval2 $EVAL2_N 3 \"\$UNSEEN\"
+"

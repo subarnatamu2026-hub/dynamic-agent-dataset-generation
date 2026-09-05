@@ -1,0 +1,165 @@
+# Running Craftium dataset generation on TAMU HPRC
+
+Parallel, headless dataset generation on HPRC (Grace/FASTER) using a Slurm job
+array. One CPU worker per array task; each worker (`--rank`) processes a disjoint
+slice of the dataset's level seeds, so terrains never overlap between workers.
+
+Everything lives in **`$SCRATCH`** (`/scratch/user/subarna_tamu.2026`).
+
+> These are templates. Cluster-specific bits you must fill: the `--account` and
+> `--partition` in `generate_array.slurm`. Never run heavy work on the login node.
+>
+> **On Grace the container tool is `singularity`** (already on PATH at
+> `/usr/bin/singularity`; no `module load` needed). Everywhere below that says
+> `apptainer`, use `singularity` with the same arguments.
+
+## FASTER quick path (Charliecloud, no WSL needed)
+FASTER has no Singularity/Apptainer — it uses **Charliecloud**, which builds
+unprivileged, so the whole thing runs on-cluster. Account is funded, partition is
+`cpu`. From `$SCRATCH/dynamic-agent-dataset-generation` (after cloning, §1):
+```bash
+CONTAINER_KIND=charliecloud CONTAINER_MODULE=charliecloud/0.33 \
+ACCOUNT=142689572675 PARTITION=cpu ./hprc/submit_all.sh
+```
+This auto-submits (all detached, dependency-chained): **build the Charliecloud
+image** (`hprc/Dockerfile` -> `$SCRATCH/craftium.sqfs`) -> **setup venv** ->
+**prepare** -> **3 generation arrays**. Log out; it keeps running. Use the exact
+`charliecloud/NN` version from `module avail`. Everything below is the general/
+Grace (Singularity) reference.
+
+## 0. Connect with MobaXterm
+- Session → SSH. Remote host: `grace.hprc.tamu.edu` (or `faster.hprc.tamu.edu`).
+  Username: your NetID (`subarna_tamu.2026`). Port 22.
+- Authenticate with NetID password + Duo 2FA (approve the push).
+- Once in, go to scratch: `cd $SCRATCH` (this is `/scratch/user/subarna_tamu.2026`).
+
+## 1. Get the code
+```bash
+cd $SCRATCH
+git clone -b claude/craftium-dynamic-agents-cauneh \
+  https://github.com/subarnatamu2026-hub/dynamic-agent-dataset-generation dynamic-agent-dataset-generation
+cd dynamic-agent-dataset-generation
+git submodule update --init --recursive
+# point the craftium submodule at your fork's branch
+cd gym_envs/craftium
+git remote add subarna https://github.com/subarnatamu2026-hub/craftium 2>/dev/null || true
+git fetch subarna claude/craftium-dynamic-agents-cauneh
+git checkout claude/craftium-dynamic-agents-cauneh
+git submodule update --init --recursive     # pulls VoxeLibre + mobs
+cd $SCRATCH/dynamic-agent-dataset-generation
+```
+
+## 2. Build the container (system deps) — once
+On Grace (login node has direct internet):
+```bash
+cd $SCRATCH/dynamic-agent-dataset-generation
+singularity build --fakeroot $SCRATCH/craftium.sif hprc/craftium.def
+```
+If Grace refuses `--fakeroot` (most HPRC sites disable user fakeroot), build the
+image on a machine where you have root — e.g. your WSL laptop, which already has a
+working setup — and copy it over:
+Grace disables user `--fakeroot` (`libsubid: -1`), so build on WSL where you have
+root, then copy the finished image:
+```bash
+# on WSL:
+sudo add-apt-repository -y ppa:apptainer/ppa
+sudo apt update && sudo apt install -y apptainer
+cd ~/dynamic-agent-dataset-generation && sudo apptainer build craftium.sif hprc/craftium.def   # real root; no --fakeroot
+scp craftium.sif subarna_tamu.2026@grace.hprc.tamu.edu:/scratch/user/subarna_tamu.2026/
+```
+(or drag `craftium.sif` into `/scratch/user/subarna_tamu.2026/` via MobaXterm's SFTP panel).
+
+## RECOMMENDED: run everything detached (survives logout / laptop close)
+Interactive `srun --pty` sessions DIE when you disconnect. Instead submit the
+whole pipeline as dependency-chained **batch** jobs and walk away. After the
+container `.sif` is in `$SCRATCH` (steps 1-2), just run:
+```bash
+cd $SCRATCH/dynamic-agent-dataset-generation
+ACCOUNT=<your_account> PARTITION=cpu ./hprc/submit_all.sh
+# find your account with:  myproject
+```
+This queues: **setup** (build venv) -> **prepare** (split + init) -> **3 generation
+arrays** (train / eval1 / eval2), each starting only after the previous
+finishes. Default sizes: **train 100, eval1 28 (seen), eval2 12 (unseen)**, each
+level with **exactly 10 mobs** (mixed species) over 600 frames. You can log out
+immediately. Monitor / manage anytime with:
+```bash
+squeue -u $USER            # what's running/queued
+tail -f logs/craftium-*_*.out
+scancel -u $USER           # cancel everything if needed
+```
+Tune worker counts with `WS_TRAIN`/`WS_EVAL1`/`WS_EVAL2` (array widths) and sizes
+with `TRAIN_N`/`EVAL1_N`/`EVAL2_N`.
+
+**Smoke test first (recommended):** generate just 2 levels per dataset to eyeball
+the video + `data_dynamic` before the full run:
+```bash
+CONTAINER_KIND=charliecloud CONTAINER_MODULE=charliecloud/0.33 \
+ACCOUNT=<your_account> PARTITION=cpu ./hprc/smoke_test.sh
+```
+
+Steps 3-6 below are the manual, step-by-step equivalents if you prefer to run
+each phase yourself.
+
+## 3. Build the Python env (torch + craftium) — once
+Compiles Minetest into `$SCRATCH/dynamic-agent-dataset-generation/.venv`. Do it in an interactive job.
+`WebProxy` gives the compute node outbound internet (Singularity passes it into
+the container) so `uv sync` can download torch etc.:
+```bash
+srun --time=02:00:00 --cpus-per-task=8 --mem=16G --pty bash
+module load WebProxy
+cd $SCRATCH/dynamic-agent-dataset-generation
+singularity exec --bind /scratch $SCRATCH/craftium.sif bash hprc/setup_env.sh
+exit    # leave the interactive job
+```
+
+## 4. Make the agent split — once
+```bash
+apptainer exec --bind /scratch $SCRATCH/craftium.sif bash -lc \
+  "cd $SCRATCH/dynamic-agent-dataset-generation && source .venv/bin/activate && python tools/agent_splits.py"
+# writes datasets/agent_split/{seen.txt,unseen.txt}  (36 seen / 15 unseen)
+```
+
+## 5. Initialize each dataset's seeds — once per dataset (light, no Minetest)
+```bash
+SEEN=$(cat datasets/agent_split/seen.txt)
+UNSEEN=$(cat datasets/agent_split/unseen.txt)
+run_init () {  # name  nlevels  seed  entities
+  apptainer exec --bind /scratch $SCRATCH/craftium.sif bash -lc \
+   "cd $SCRATCH/dynamic-agent-dataset-generation && source .venv/bin/activate && \
+    uv run python dataset_toolkits/generate_raw_data.py --dataset_dir datasets \
+      --dataset_name $1 --env_id OpenWorldCreative-v0 --ep_timesteps 600 \
+      --seed $3 --init --num_levels $2 --dynamic_agent_entities '$4'"
+}
+run_init train 100 1 "$SEEN"
+run_init eval1 28  2 "$SEEN"
+run_init eval2 12  3 "$UNSEEN"
+```
+
+## 6. Submit the parallel generation (one array per dataset)
+Array size == `WORLD_SIZE`. More tasks = faster (bounded by your allocation).
+```bash
+SEEN=$(cat datasets/agent_split/seen.txt)
+UNSEEN=$(cat datasets/agent_split/unseen.txt)
+
+sbatch --array=0-49 --export=ALL,WORLD_SIZE=50,DATASET=train,ENTITIES="$SEEN"  hprc/generate_array.slurm
+sbatch --array=0-27 --export=ALL,WORLD_SIZE=28,DATASET=eval1,ENTITIES="$SEEN"  hprc/generate_array.slurm
+sbatch --array=0-11 --export=ALL,WORLD_SIZE=12,DATASET=eval2,ENTITIES="$UNSEEN" hprc/generate_array.slurm
+```
+Rule: the `--array=0-(N-1)` upper bound must be `WORLD_SIZE-1`.
+
+## 7. Monitor / results
+```bash
+squeue -u $USER            # running/queued tasks
+tail -f logs/craftium-gen_*_*.out
+ls datasets/train/raw/OpenWorldCreative-v0/ | wc -l   # levels done so far
+```
+Re-running an array is safe: existing levels are skipped, only missing seeds are
+filled (add `--overwrite_leveldata` only if you want to redo them).
+
+## Sizing tips
+- ~2 CPUs + ~6 GB RAM per worker is plenty (one headless Minetest each).
+- 600 frames/level is roughly a couple minutes; 100 levels / 50 workers ≈ well
+  under an hour. Scale `WORLD_SIZE` (and the array) up to what your allocation allows.
+- Keep `datasets/` on `$SCRATCH` (it can get large). Copy finished datasets to
+  more permanent storage when done, since scratch is purged periodically.
