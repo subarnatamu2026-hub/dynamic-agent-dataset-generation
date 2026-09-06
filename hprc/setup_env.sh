@@ -17,6 +17,16 @@ export PLAYWRIGHT_BROWSERS_PATH=0
 
 cd "${SCRATCH}/dynamic-agent-dataset-generation"
 
+# Craftium (engine + mods) is NOT vendored in this repo; clone the fork into
+# gym_envs/craftium (the pyproject path dependency) before uv sync. Guarded so a
+# rerun doesn't re-clone.
+if [ ! -e gym_envs/craftium/pyproject.toml ]; then
+  echo "==> Cloning craftium fork into gym_envs/craftium"
+  rm -rf gym_envs/craftium
+  git clone --recursive -b claude/craftium-dynamic-agents-cauneh \
+    https://github.com/subarnatamu2026-hub/craftium gym_envs/craftium
+fi
+
 echo "==> Building venv (torch + craftium). This compiles Minetest; ~15-30 min."
 uv sync --group cu --group env
 
